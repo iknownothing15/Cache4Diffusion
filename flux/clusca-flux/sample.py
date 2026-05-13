@@ -1,4 +1,5 @@
 import os
+import pickle
 import re
 import time
 from dataclasses import dataclass
@@ -32,13 +33,191 @@ class SamplingOptions:
     add_sampling_metadata: bool # Whether to add metadata
     use_nsfw_filter: bool       # Whether to enable NSFW filter
     test_FLOPs: bool            # Whether in FLOPs test mode (no actual image generation)
-    #interval: int               # Cache period length
-    #max_order: int              # Maximum order of Taylor expansion
-    #first_enhance: int          # Initial enhancement steps
+    mode: str = 'Taylor'        # Pipeline mode: embed / infer / cache strategy
+
+
+def embed_prompts(opts: SamplingOptions, embed_path: str):
+    """Step 1: Encode all prompts with T5/CLIP and save to a pickle file."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"[Embed Mode] Encoding prompts and saving to: {embed_path}")
+
+    # Load only T5 and CLIP (no model, no AE)
+    t5 = load_t5(device, max_length=256 if opts.model_name == "flux-schnell" else 512)
+    clip = load_clip(device)
+
+    # Set random seed
+    base_seed = opts.seed if opts.seed is not None else torch.randint(0, 2**32, (1,)).item()
+
+    prompts = opts.prompts
+    num_prompt_batches = (len(prompts) + opts.batch_size - 1) // opts.batch_size
+    all_inputs = []
+    idx = 0
+
+    for batch_idx in tqdm(range(num_prompt_batches), desc="Encoding prompts"):
+        prompt_start = batch_idx * opts.batch_size
+        prompt_end = min(prompt_start + opts.batch_size, len(prompts))
+        batch_prompts = prompts[prompt_start:prompt_end]
+        num_prompts_in_batch = len(batch_prompts)
+
+        for image_idx in range(opts.num_images_per_prompt):
+            seed = base_seed + idx
+            idx += num_prompts_in_batch
+
+            x = get_noise(
+                num_prompts_in_batch, opts.height, opts.width,
+                device=device, dtype=torch.bfloat16, seed=seed,
+            )
+
+            inp = prepare(t5, clip, x, prompt=batch_prompts)
+            timesteps = get_schedule(opts.num_steps, inp["img"].shape[1],
+                                     shift=(opts.model_name != "flux-schnell"))
+
+            # Move tensors to CPU for pickling
+            inp_cpu = {k: v.cpu() for k, v in inp.items()}
+            all_inputs.append({
+                'inp': inp_cpu,
+                'timesteps': timesteps,
+                'seed': seed,
+                'prompts': list(batch_prompts),
+                'num_prompts_in_batch': num_prompts_in_batch,
+            })
+
+    # Save to pickle
+    os.makedirs(os.path.dirname(embed_path) if os.path.dirname(embed_path) else '.', exist_ok=True)
+    with open(embed_path, 'wb') as f:
+        pickle.dump({
+            'inputs': all_inputs,
+            'width': opts.width,
+            'height': opts.height,
+            'num_steps': opts.num_steps,
+            'guidance': opts.guidance,
+            'model_name': opts.model_name,
+        }, f)
+    print(f"[Embed Mode] Done. {len(all_inputs)} entries saved to {embed_path}")
+
+
+def infer_from_embeddings(opts: SamplingOptions, model_kwargs: dict, embed_path: str):
+    """Step 2: Load precomputed embeddings and run denoising + decoding."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"[Infer Mode] Loading embeddings from: {embed_path}")
+
+    with open(embed_path, 'rb') as f:
+        embed_data = pickle.load(f)
+
+    all_inputs = embed_data['inputs']
+    # Adopt saved config for unspecified / default values
+    if opts.width == 1360:
+        opts.width = embed_data.get('width', opts.width)
+    if opts.height == 768:
+        opts.height = embed_data.get('height', opts.height)
+    if opts.num_steps is None:
+        opts.num_steps = embed_data.get('num_steps', opts.num_steps)
+    if opts.guidance == 3.5:
+        opts.guidance = embed_data.get('guidance', opts.guidance)
+
+    # Optional NSFW classifier
+    nsfw_classifier = None
+    if opts.use_nsfw_filter:
+        nsfw_classifier = pipeline(
+            "image-classification",
+            model="/root/autodl-tmp/pretrained_models/Falconsai/nsfw_image_detection",
+            device=device,
+        )
+
+    # Ensure width/height are multiples of 16
+    opts.width = 16 * (opts.width // 16)
+    opts.height = 16 * (opts.height // 16)
+
+    cache_mode = model_kwargs.get('cache_mode', 'Taylor')
+    opts.output_dir = os.path.join(
+        opts.output_dir,
+        f"{model_kwargs['fresh_threshold']}-{model_kwargs['max_order']}",
+        f"{cache_mode}",
+        f"{model_kwargs['cluster_num']}",
+        f"{model_kwargs['cluster_method']}",
+        f"{model_kwargs['k']}",
+        f"{model_kwargs['propagation_ratio']}",
+    )
+    print("generating images in:", opts.output_dir)
+    output_name = os.path.join(opts.output_dir, "img_{idx}.jpg")
+    os.makedirs(opts.output_dir, exist_ok=True)
+
+    # Load model and AE only (no T5/CLIP needed)
+    model = load_flow_model(opts.model_name, device=device)
+    ae = load_ae(opts.model_name, device=device)
+
+    total_images = sum(entry['num_prompts_in_batch'] for entry in all_inputs)
+    progress_bar = tqdm(total=total_images, desc="Generating images")
+    global_idx = 0
+
+    for data in all_inputs:
+        inp = {k: v.to(device) for k, v in data['inp'].items()}
+        timesteps = data['timesteps']
+        batch_prompts = data['prompts']
+        batch_size = data['num_prompts_in_batch']
+
+        with torch.no_grad():
+            infer_kwargs = dict(model_kwargs)
+            infer_kwargs['mode'] = cache_mode
+            x = denoise_cache(model, **inp, timesteps=timesteps,
+                              guidance=opts.guidance, model_kwargs=infer_kwargs)
+
+            x = unpack(x.float(), opts.height, opts.width)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                x = ae.decode(x)
+
+        # Convert to PIL and save
+        x = x.clamp(-1, 1)
+        x = embed_watermark(x.float())
+        x = rearrange(x, "b c h w -> b h w c")
+
+        for i in range(batch_size):
+            img_array = x[i]
+            img = Image.fromarray((127.5 * (img_array + 1.0)).cpu().byte().numpy())
+
+            nsfw_score = 0.0
+            if opts.use_nsfw_filter:
+                nsfw_result = nsfw_classifier(img)
+                nsfw_score = next((res["score"] for res in nsfw_result if res["label"] == "nsfw"), 0.0)
+
+            if nsfw_score < NSFW_THRESHOLD:
+                exif_data = Image.Exif()
+                exif_data[ExifTags.Base.Software] = "AI generated;txt2img;flux"
+                exif_data[ExifTags.Base.Make] = "Black Forest Labs"
+                exif_data[ExifTags.Base.Model] = opts.model_name
+                if opts.add_sampling_metadata:
+                    exif_data[ExifTags.Base.ImageDescription] = batch_prompts[i]
+                fn = output_name.format(idx=global_idx + i)
+                img.save(fn, exif=exif_data, quality=95, subsampling=0)
+            else:
+                print("Generated image may contain inappropriate content, skipped.")
+
+            progress_bar.update(1)
+
+        global_idx += batch_size
+
+    progress_bar.close()
+    print(f"[Infer Mode] Done. Generated {global_idx} images.")
 
 
 def main(opts: SamplingOptions, model_kwargs: dict):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Resolve embed_path default
+    embed_path = model_kwargs.get('embed_path', None)
+    if embed_path is None:
+        embed_path = os.path.join(opts.output_dir, 'embeddings.pkl')
+
+    # --- Dispatch: embed / infer / full pipeline ---
+    if opts.mode == 'embed':
+        embed_prompts(opts, embed_path)
+        return
+
+    if opts.mode == 'infer':
+        infer_from_embeddings(opts, model_kwargs, embed_path)
+        return
+
+    # ==================== ORIGINAL FULL PIPELINE (other modes) ====================
 
     # Optional NSFW classifier
     if opts.use_nsfw_filter:
@@ -202,7 +381,17 @@ def app():
     parser.add_argument('--add_sampling_metadata', action='store_true', help='Whether to add prompt metadata to images.')
     parser.add_argument('--use_nsfw_filter', action='store_true', help='Enable NSFW filter.')
     parser.add_argument('--test_FLOPs', action='store_true', help='Test inference computation cost.')
-    parser.add_argument('--mode', type=str, default='Taylor', choices=['Taylor-Cache', 'ToCa', 'Taylor', 'ClusCa'], help='Cache mode.')
+    parser.add_argument('--mode', type=str, default='Taylor',
+                        choices=['embed', 'infer', 'Taylor-Cache', 'ToCa', 'Taylor', 'ClusCa'],
+                        help='Pipeline mode: "embed" saves prompt embeddings to disk, '
+                             '"infer" loads embeddings and runs denoising, '
+                             'other values run the full pipeline with the specified cache strategy.')
+    parser.add_argument('--embed_path', type=str, default=None,
+                        help='Path to save/load prompt embeddings pickle file. '
+                             'Used in embed/infer modes. Default: <output_dir>/embeddings.pkl')
+    parser.add_argument('--cache_mode', type=str, default='Taylor',
+                        choices=['Taylor-Cache', 'ToCa', 'Taylor', 'ClusCa'],
+                        help='Cache strategy used in infer mode (default: Taylor).')
     parser.add_argument('--max_order', type=int, default=1, help='Max order of Taylor expansion.')
     parser.add_argument('--fresh_threshold', type=int, default=5, help='Fresh threshold.')
     
@@ -229,6 +418,7 @@ def app():
         add_sampling_metadata=args.add_sampling_metadata,
         use_nsfw_filter=args.use_nsfw_filter,
         test_FLOPs=args.test_FLOPs,
+        mode=args.mode,
     )
 
     model_kwargs = {
@@ -239,6 +429,8 @@ def app():
         'cluster_num': args.cluster_num,
         'cluster_method': args.cluster_method,
         'k': args.k,
+        'embed_path': args.embed_path,
+        'cache_mode': args.cache_mode,
     }
 
     main(opts, model_kwargs)
