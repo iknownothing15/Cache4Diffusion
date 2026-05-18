@@ -98,6 +98,7 @@ def embed_prompts(opts: SamplingOptions, embed_path: str):
 
 def infer_from_embeddings(opts: SamplingOptions, model_kwargs: dict, embed_path: str):
     """Step 2: Load precomputed embeddings and run denoising + decoding."""
+    model_kwargs['topk'] = model_kwargs.get('k', 1)  # Ensure topk is set for caching strategies
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[Infer Mode] Loading embeddings from: {embed_path}")
 
