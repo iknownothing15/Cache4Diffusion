@@ -138,6 +138,7 @@ def infer_from_embeddings(opts: SamplingOptions, model_kwargs: dict, embed_path:
         f"{model_kwargs['k']}",
         f"{model_kwargs['propagation_ratio']}",
     )
+    model_kwargs['topk'] = model_kwargs.get('k', 1)
     print("generating images in:", opts.output_dir)
     output_name = os.path.join(opts.output_dir, "img_{idx}.jpg")
     os.makedirs(opts.output_dir, exist_ok=True)
