@@ -117,6 +117,7 @@ def cache_init(timesteps, model_kwargs:dict | None):
         cache_dic['cluster_num'] = model_kwargs['cluster_num']
         cache_dic['cluster_method'] = model_kwargs['cluster_method']
         cache_dic['k'] = model_kwargs['k']
+        cache_dic['topk'] = model_kwargs['k']
         cache_dic['propagation_ratio'] = model_kwargs['propagation_ratio']
 
         cluster_info_dict = {}
