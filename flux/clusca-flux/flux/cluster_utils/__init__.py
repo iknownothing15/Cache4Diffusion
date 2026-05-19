@@ -12,6 +12,7 @@ def get_cluster_info(X, cache_dic, current):
     cluster_indices, cache_centroids = Kmeans(n_clusters=cluster_num, init='random').fit(X, cache_centroids)
     cluster_info['cluster_num'] = cluster_num
     cluster_info['topk'] = k
+    cluster_info['k'] = k
     cluster_info['cluster_indices'] = cluster_indices
     cluster_info['centroids'] = cache_centroids
     cache_dic['cluster_info'][current['stream']][current['module']] = copy.deepcopy(cluster_info)
